@@ -1,5 +1,6 @@
 import sys
 import io
+import os
 import re
 from typing import BinaryIO, Any
 
@@ -73,6 +74,160 @@ ACCEPTED_MIME_TYPE_PREFIXES = [
 ]
 
 ACCEPTED_FILE_EXTENSIONS = [".pdf"]
+
+
+def _find_column_split(page: Any) -> float | None:
+    """
+    Detect pages laid out as two text columns, e.g. scientific papers, and
+    return the x position of the gutter (None if the page is not multi-column).
+
+    A page is considered multi-column when a vertical gutter near the middle of
+    the page is crossed by almost no words, and both sides of the gutter hold a
+    substantial amount of prose-like text (many reasonably long lines). Such
+    pages must be read column by column; row-based extraction interleaves them.
+    """
+    try:
+        words = page.extract_words()
+    except Exception:
+        return None
+    if len(words) < 150:
+        return None
+
+    page_width = float(getattr(page, "width", 612))
+    lo, hi = page_width * 0.35, page_width * 0.65
+    total = len(words)
+
+    # Sweep candidate gutter positions across the central band and keep the
+    # ones crossed by (almost) no words. Full-width titles/captions are few.
+    max_crossing = max(3, int(total * 0.03))
+    step = 2.0
+    gutter: list[float] = []
+    x = lo
+    while x <= hi:
+        crossing = sum(1 for w in words if w["x0"] < x < w["x1"])
+        if crossing <= max_crossing:
+            gutter.append(x)
+        x += step
+
+    # Require a contiguous empty channel at least ~6pt wide
+    if not gutter or (gutter[-1] - gutter[0]) < 6:
+        return None
+    split_x = (gutter[0] + gutter[-1]) / 2
+
+    def prose_lines(side: list[dict]) -> int:
+        lines: dict[int, list[dict]] = {}
+        for w in side:
+            lines.setdefault(round(w["top"] / 3), []).append(w)
+        return sum(
+            1
+            for ws in lines.values()
+            if sum(len(w["text"]) for w in ws) >= 25 and len(ws) >= 4
+        )
+
+    left = [w for w in words if w["x1"] <= split_x]
+    right = [w for w in words if w["x0"] >= split_x]
+    if prose_lines(left) >= 10 and prose_lines(right) >= 10:
+        return split_x
+    return None
+
+
+def _looks_glued(text: str) -> bool:
+    """True when extracted text has (almost) no spaces between words."""
+    chars = [c for c in text if not c.isspace()]
+    if len(chars) < 200:
+        return False
+    return text.count(" ") / len(chars) < 0.08
+
+
+def _extract_columns_text(
+    page: Any, split_x: float, images: list[dict] | None = None
+) -> str:
+    """
+    Read a two-column page column by column from pdfplumber's words.
+
+    Full-width rows (titles, spanning captions) are emitted in place; between
+    them the left column is read completely before the right one. Images
+    (with their "link") are placed at their position in that same order. Used
+    when pdfminer cannot see the gaps between words (PDFs without space
+    glyphs).
+    """
+    words = page.extract_words(x_tolerance=1.0)
+    words.sort(key=lambda w: (w["top"], w["x0"]))
+
+    # Cluster words into visual rows to spot full-width rows
+    rows: list[list[dict]] = []
+    for w in words:
+        if rows and abs(w["top"] - rows[-1][0]["top"]) <= 3:
+            rows[-1].append(w)
+        else:
+            rows.append([w])
+
+    def is_full_width(row: list[dict]) -> bool:
+        if any(w["x0"] < split_x < w["x1"] for w in row):
+            return True
+        left = [w["x1"] for w in row if w["x1"] <= split_x]
+        right = [w["x0"] for w in row if w["x0"] >= split_x]
+        # Centered titles break between words close to the gutter
+        return bool(left and right and min(right) - max(left) < 10)
+
+    def lines_of(ws: list[dict]) -> list[str]:
+        ws = sorted(ws, key=lambda w: (w["top"], w["x0"]))
+        out: list[list[dict]] = []
+        for w in ws:
+            # An image is always a line of its own
+            if (
+                out
+                and not w.get("img")
+                and not out[-1][0].get("img")
+                and abs(w["top"] - out[-1][0]["top"]) <= 3
+            ):
+                out[-1].append(w)
+            else:
+                out.append([w])
+        return [
+            " ".join(x["text"] for x in sorted(line, key=lambda w: w["x0"]))
+            for line in out
+        ]
+
+    # Rows and images in top-to-bottom order
+    events: list[tuple[float, str, Any]] = [(r[0]["top"], "row", r) for r in rows]
+    for im in images or []:
+        events.append((im["top"], "img", im))
+    events.sort(key=lambda e: e[0])
+
+    result: list[str] = []
+    left_buf: list[dict] = []
+    right_buf: list[dict] = []
+
+    def flush() -> None:
+        result.extend(lines_of(left_buf))
+        result.extend(lines_of(right_buf))
+        left_buf.clear()
+        right_buf.clear()
+
+    for _, kind, obj in events:
+        if kind == "row":
+            if is_full_width(obj):
+                flush()
+                result.extend(lines_of(obj))
+            else:
+                for w in obj:
+                    (left_buf if w["x1"] <= split_x else right_buf).append(w)
+        elif obj["x0"] < split_x < obj["x1"]:
+            flush()
+            result.append(obj["link"])
+        else:
+            pseudo = {
+                "text": obj["link"],
+                "x0": obj["x0"],
+                "x1": obj["x1"],
+                "top": obj["top"],
+                "img": True,
+            }
+            center = (obj["x0"] + obj["x1"]) / 2
+            (left_buf if center < split_x else right_buf).append(pseudo)
+    flush()
+    return "\n".join(result)
 
 
 def _to_markdown_table(table: list[list[str]], include_separator: bool = True) -> str:
@@ -492,6 +647,120 @@ def _extract_tables_from_words(page: Any) -> list[list[list[str]]]:
     return [table_rows]
 
 
+def _save_page_images(
+    page: Any, page_idx: int, images_dir: str, stem: str, min_size: float = 50.0
+) -> list[dict]:
+    """
+    Save the embedded raster images of a page into `images_dir`. Returns, for
+    each image (top-to-bottom, left-to-right), its page position
+    (x0, x1, top, bottom) and its Markdown link under "link".
+
+    Images are rendered from their bounding box on the page (so any filter or
+    colorspace is handled), at their native resolution. Tiny images (icons,
+    rules) are skipped.
+    """
+    found: list[dict] = []
+    try:
+        images = sorted(page.images, key=lambda im: (im["top"], im["x0"]))
+    except Exception:
+        return found
+
+    x0p, y0p, x1p, y1p = page.bbox
+    n = 0
+    for im in images:
+        width, height = im["x1"] - im["x0"], im["bottom"] - im["top"]
+        if width < min_size or height < min_size:
+            continue
+        bbox = (
+            max(im["x0"], x0p),
+            max(im["top"], y0p),
+            min(im["x1"], x1p),
+            min(im["bottom"], y1p),
+        )
+        if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            continue
+
+        resolution = 150.0
+        srcsize = im.get("srcsize")
+        if srcsize and srcsize[0]:
+            # Match the image's native pixel density, within sane bounds
+            resolution = min(300.0, max(72.0, srcsize[0] / (width / 72.0)))
+
+        n += 1
+        name = f"{stem}_p{page_idx + 1}_img{n}.png"
+        try:
+            os.makedirs(images_dir, exist_ok=True)
+            page.crop(bbox).to_image(resolution=resolution).save(
+                os.path.join(images_dir, name)
+            )
+        except Exception:
+            n -= 1
+            continue
+        found.append(
+            {
+                "x0": bbox[0],
+                "x1": bbox[2],
+                "top": bbox[1],
+                "bottom": bbox[3],
+                "link": f"![{stem} page {page_idx + 1} image {n}]"
+                f"({os.path.join(images_dir, name)})",
+            }
+        )
+    return found
+
+
+def _reading_key(
+    x0: float, x1: float, cy: float, split_x: float, separators: list[float]
+) -> tuple[int, int, float]:
+    """
+    Sort key (top-down y: cy grows downwards) for a two-column page.
+
+    Full-width items (crossing the gutter) split the page into bands; inside a
+    band the left column is read before the right one.
+    """
+    above = sum(1 for sep in separators if sep < cy)
+    if x0 < split_x < x1:
+        return (above, 2, cy)
+    return (above, 0 if (x0 + x1) / 2 < split_x else 1, cy)
+
+
+def _pdfminer_page_with_images(
+    pdf_bytes: Any, page_idx: int, page_height: float, split_x: float, images: list[dict]
+) -> str:
+    """pdfminer's text boxes for one two-column page, with images in place."""
+    from pdfminer.layout import LTTextContainer
+
+    items: list[tuple[float, float, float, str]] = []  # x0, x1, cy(top-down), text
+    pdf_bytes.seek(0)
+    for layout in pdfminer.high_level.extract_pages(pdf_bytes, page_numbers=[page_idx]):
+        for obj in layout:
+            if isinstance(obj, LTTextContainer):
+                text = obj.get_text().strip()
+                if text:
+                    cy = page_height - (obj.y0 + obj.y1) / 2
+                    items.append((obj.x0, obj.x1, cy, text))
+    for im in images:
+        items.append((im["x0"], im["x1"], (im["top"] + im["bottom"]) / 2, im["link"]))
+
+    separators = [cy for x0, x1, cy, _ in items if x0 < split_x < x1]
+    items.sort(key=lambda it: _reading_key(it[0], it[1], it[2], split_x, separators))
+    return "\n\n".join(text for *_, text in items)
+
+
+def _plain_page_with_images(page: Any, images: list[dict]) -> str:
+    """Single-column page text with images placed at their vertical position."""
+    items: list[tuple[float, str]] = []
+    try:
+        for line in page.extract_text_lines():
+            items.append((line["top"], line["text"]))
+    except Exception:
+        items = [(0.0, page.extract_text() or "")]
+    for im in images:
+        items.append(((im["top"] + im["bottom"]) / 2, "\n" + im["link"] + "\n"))
+    items.sort(key=lambda it: it[0])
+    return "\n".join(text for _, text in items)
+
+
 class PdfConverter(DocumentConverter):
     """
     Converts PDFs to Markdown.
@@ -545,31 +814,88 @@ class PdfConverter(DocumentConverter):
             # pages are collected separately. page.close() is called
             # after each page to free pdfplumber's cached objects and
             # keep memory usage constant regardless of page count.
+            images_dir = kwargs.get("images_dir")
+            stem = "document"
+            if stream_info.filename:
+                stem = os.path.splitext(os.path.basename(stream_info.filename))[0]
+            positional_pages: dict[int, str] = {}
             markdown_chunks: list[str] = []
             form_page_count = 0
-            plain_page_indices: list[int] = []
+            multi_column_page_count = 0
+            pdfminer_pages: list[str] | None = None
 
             with pdfplumber.open(pdf_bytes) as pdf:
                 for page_idx, page in enumerate(pdf.pages):
+                    images = (
+                        _save_page_images(page, page_idx, images_dir, stem)
+                        if images_dir
+                        else []
+                    )
+
+                    # Multi-column prose (e.g. papers) is read correctly by
+                    # pdfminer's layout analysis; row-based extraction
+                    # interleaves the columns.
+                    split_x = _find_column_split(page)
+                    if split_x is not None:
+                        if pdfminer_pages is None:
+                            pdf_bytes.seek(0)
+                            pdfminer_pages = pdfminer.high_level.extract_text(
+                                pdf_bytes
+                            ).split("\f")
+                        text = (
+                            pdfminer_pages[page_idx]
+                            if page_idx < len(pdfminer_pages)
+                            else ""
+                        )
+                        # Some PDFs have no space glyphs and pdfminer glues the
+                        # words together; pdfplumber's word boxes still work.
+                        if _looks_glued(text):
+                            text = _extract_columns_text(page, split_x, images)
+                        elif images:
+                            text = _pdfminer_page_with_images(
+                                pdf_bytes, page_idx, float(page.height), split_x, images
+                            )
+                        multi_column_page_count += 1
+                        if text.strip():
+                            markdown_chunks.append(text.strip())
+                        page.close()
+                        continue
+
                     page_content = _extract_form_content_from_words(page)
 
                     if page_content is not None:
                         form_page_count += 1
                         if page_content.strip():
                             markdown_chunks.append(page_content)
+                        # Table layout is rebuilt from words, so images of a
+                        # form page go after its content.
+                        if images:
+                            markdown_chunks.append(
+                                "\n\n".join(im["link"] for im in images)
+                            )
                     else:
-                        plain_page_indices.append(page_idx)
-                        text = page.extract_text()
+                        if images:
+                            text = _plain_page_with_images(page, images)
+                            positional_pages[page_idx] = text
+                        else:
+                            text = page.extract_text()
                         if text and text.strip():
                             markdown_chunks.append(text.strip())
 
                     page.close()  # Free cached page data immediately
 
-            # If no pages had form-style content, use pdfminer for
-            # the whole document (better text spacing for prose).
-            if form_page_count == 0:
+            # If no pages had form-style or multi-column content, use pdfminer
+            # for the whole document (better text spacing for prose).
+            if form_page_count == 0 and multi_column_page_count == 0:
                 pdf_bytes.seek(0)
                 markdown = pdfminer.high_level.extract_text(pdf_bytes)
+                if positional_pages:
+                    # Pages with images keep their images in place
+                    pages = markdown.split("\f")
+                    for idx, text in positional_pages.items():
+                        if idx < len(pages):
+                            pages[idx] = text
+                    markdown = "\n\n".join(p.strip() for p in pages)
             else:
                 markdown = "\n\n".join(markdown_chunks).strip()
 

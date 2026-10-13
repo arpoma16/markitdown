@@ -1386,3 +1386,227 @@ def test_markitdown_remote() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def _text_pdf_bytes(streams: list[bytes]) -> bytes:
+    """Build a minimal Helvetica text PDF (one content stream per page)."""
+    n_pages = len(streams)
+    kids = " ".join(f"{3 + 2 * i} 0 R" for i in range(n_pages)).encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % n_pages,
+    ]
+    font_id = 3 + 2 * n_pages
+    for i, content in enumerate(streams):
+        objects.append(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Contents %d 0 R /Resources << /Font << /F1 %d 0 R >> >> >>"
+            % (4 + 2 * i, font_id)
+        )
+        objects.append(
+            b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream"
+        )
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for n, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % n + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        xref,
+    )
+    return bytes(out)
+
+
+def _two_column_page(lines_per_column: int = 30) -> bytes:
+    ops = ["BT", "/F1 10 Tf", "12 TL"]
+    for x, tag in ((54, "LEFT"), (330, "RIGHT")):
+        ops.append(f"1 0 0 1 {x} 740 Tm")
+        for i in range(lines_per_column):
+            ops.append(f"({tag}{i:02d} alpha beta gamma delta epsilon zeta) Tj T*")
+    ops.append("ET")
+    return "\n".join(ops).encode()
+
+
+def _table_page() -> bytes:
+    ops = ["BT", "/F1 10 Tf"]
+    for row in range(8):
+        for x, col in ((54, "Item"), (200, "Qty"), (350, "Price"), (480, "Total")):
+            ops.append(f"1 0 0 1 {x} {740 - row * 20} Tm ({col}{row}) Tj")
+    ops.append("ET")
+    return "\n".join(ops).encode()
+
+
+class TestPdfMultiColumn:
+    """Two-column pages must be read column by column, not row by row."""
+
+    def test_two_column_page_next_to_form_page(self):
+        import io
+
+        pdf = _text_pdf_bytes([_two_column_page(), _table_page()])
+        text = (
+            MarkItDown()
+            .convert_stream(io.BytesIO(pdf), file_extension=".pdf")
+            .text_content
+        )
+        # The whole left column is read before the right column starts...
+        assert text.index("LEFT29") < text.index("RIGHT00")
+        assert "LEFT00 alpha beta gamma delta epsilon zeta RIGHT00" not in text
+        # ...and the real table on the other page is still a markdown table.
+        assert "| Item0 | Qty0 | Price0 | Total0 |" in text
+
+
+class _FakePage:
+    def __init__(self, words):
+        self._words = words
+
+    def extract_words(self, **kwargs):
+        return list(self._words)
+
+
+def _word(text, x0, x1, top):
+    return {"text": text, "x0": x0, "x1": x1, "top": top}
+
+
+class TestPdfColumnReader:
+    """Column reader used when pdfminer glues words together."""
+
+    def test_looks_glued(self):
+        from markitdown.converters._pdf_converter import _looks_glued
+
+        assert _looks_glued("Autonomousaerialinspectionofwindturbines" * 10)
+        assert not _looks_glued("Autonomous aerial inspection of wind turbines " * 10)
+
+    def test_reads_left_column_before_right_with_full_width_title(self):
+        from markitdown.converters._pdf_converter import _extract_columns_text
+
+        words = [
+            # Centered title: the break between words sits at the gutter
+            _word("Big", 200, 295, 10),
+            _word("Title", 299, 400, 10),
+            # Two columns, rows interleaved by y
+            _word("L1", 50, 100, 50),
+            _word("R1", 320, 370, 50),
+            _word("L2", 50, 100, 62),
+            _word("R2", 320, 370, 62),
+            # Full-width caption
+            _word("Spanning", 50, 400, 100),
+            _word("L3", 50, 100, 120),
+            _word("R3", 320, 370, 120),
+        ]
+        text = _extract_columns_text(_FakePage(words), split_x=300)
+        assert text.split("\n") == [
+            "Big Title",
+            "L1",
+            "L2",
+            "R1",
+            "R2",
+            "Spanning",
+            "L3",
+            "R3",
+        ]
+
+
+class _FakeCropped:
+    def __init__(self, sink, bbox):
+        self._sink, self._bbox = sink, bbox
+
+    def to_image(self, resolution):
+        sink, bbox = self._sink, self._bbox
+
+        class _Img:
+            def save(self, path):
+                sink.append((path, bbox, resolution))
+                open(path, "wb").write(b"png")
+
+        return _Img()
+
+
+class _FakeImagePage:
+    bbox = (0, 0, 612, 792)
+
+    def __init__(self, images):
+        self.images = images
+        self.saved = []
+
+    def crop(self, bbox):
+        return _FakeCropped(self.saved, bbox)
+
+
+class TestPdfImageExtraction:
+    def test_saves_images_in_reading_order_and_skips_tiny_ones(self, tmp_path):
+        from markitdown.converters._pdf_converter import _save_page_images
+
+        def img(x0, top, w, h, src=None):
+            return {
+                "x0": x0, "x1": x0 + w, "top": top, "bottom": top + h,
+                "srcsize": src,
+            }
+
+        page = _FakeImagePage(
+            [
+                img(300, 400, 200, 100),  # lower
+                img(50, 100, 200, 100, (400, 200)),  # upper, 144 dpi
+                img(10, 10, 20, 20),  # icon: skipped
+                img(500, 700, 300, 200),  # sticks out of the page: clamped
+            ]
+        )
+        out = tmp_path / "imgs"
+        links = _save_page_images(page, 1, str(out), "paper")
+
+        assert [l["link"].split("(")[1].rstrip(")") for l in links] == [
+            str(out / "paper_p2_img1.png"),
+            str(out / "paper_p2_img2.png"),
+            str(out / "paper_p2_img3.png"),
+        ]
+        assert all(os.path.exists(p) for p, _, _ in page.saved)
+        assert page.saved[0][2] == pytest.approx(144)
+        assert page.saved[2][1] == (500, 700, 612, 792)
+
+    def test_images_are_opt_in(self, tmp_path):
+        import io
+
+        pdf = _text_pdf_bytes([_two_column_page()])
+        text = (
+            MarkItDown()
+            .convert_stream(io.BytesIO(pdf), file_extension=".pdf")
+            .text_content
+        )
+        assert "![" not in text
+
+
+class TestPdfImagePlacement:
+    def test_images_are_placed_in_reading_order(self):
+        from markitdown.converters._pdf_converter import _extract_columns_text
+
+        words = [
+            _word("L1", 50, 100, 50),
+            _word("R1", 320, 370, 50),
+            _word("L2", 50, 100, 200),
+            _word("R2", 320, 370, 200),
+            _word("Caption", 50, 400, 300),  # full-width row
+        ]
+        images = [
+            # In the left column, between L1 and L2
+            {"x0": 50, "x1": 280, "top": 80, "bottom": 180, "link": "![left]()"},
+            # In the right column, after R2
+            {"x0": 320, "x1": 560, "top": 230, "bottom": 280, "link": "![right]()"},
+            # Full width, before the caption
+            {"x0": 40, "x1": 560, "top": 250, "bottom": 290, "link": "![wide]()"},
+        ]
+        text = _extract_columns_text(_FakePage(words), 300, images)
+        assert text.split("\n") == [
+            "L1",
+            "![left]()",
+            "L2",
+            "R1",
+            "R2",
+            "![right]()",
+            "![wide]()",
+            "Caption",
+        ]

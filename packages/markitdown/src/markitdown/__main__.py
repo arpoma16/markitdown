@@ -142,6 +142,13 @@ def main():
         help="Keep data URIs (like base64-encoded images) in the output. By default, data URIs are truncated.",
     )
 
+    parser.add_argument(
+        "--images-dir",
+        type=str,
+        default=None,
+        help="Directory where embedded images are saved (currently PDF). Markdown image links use this path as given. By default, images are not extracted.",
+    )
+
     parser.add_argument("filename", nargs="?")
     args = parser.parse_args()
 
@@ -248,16 +255,23 @@ def main():
     else:
         markitdown = MarkItDown(enable_plugins=args.use_plugins)
 
+    # Only forwarded when set, so default conversions are unchanged
+    extra_kwargs = {"images_dir": args.images_dir} if args.images_dir else {}
+
     if args.filename is None:
         # Windows pipe-backed stdin can report seekable() even though it cannot rewind.
         result = markitdown.convert_stream(
             io.BytesIO(sys.stdin.buffer.read()),
             stream_info=stream_info,
             keep_data_uris=args.keep_data_uris,
+            **extra_kwargs,
         )
     else:
         result = markitdown.convert(
-            args.filename, stream_info=stream_info, keep_data_uris=args.keep_data_uris
+            args.filename,
+            stream_info=stream_info,
+            keep_data_uris=args.keep_data_uris,
+            **extra_kwargs,
         )
 
     _handle_output(args, result)
